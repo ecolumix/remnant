@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use time::Instant;
-use tranche::pg::OutputFormat;
+use remnant::pg::OutputFormat;
+use std::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
             outfile,
             seed,
         } => {
-            tranche::csv::run(&file, &outfile, percent, Some(max_records as usize), seed)?;
+            remnant::csv::run(&file, &outfile, percent, Some(max_records as usize), seed)?;
         }
         Commands::Pg {
             connection_string,
@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
             seed,
             format,
         } => {
-            tranche::pg::run(&connection_string, &outdir, percent, seed, format).await?;
+            remnant::pg::run(&connection_string, &outdir, percent, seed, format).await?;
         }
     }
 

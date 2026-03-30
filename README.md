@@ -1,8 +1,8 @@
-# tranche
+# remnant
 
 ## Summary
 
-A command line tool for creating random sub-samples of data. Tranche can sample rows from CSV files or from all tables in a PostgreSQL database, outputting the results as CSV or Parquet files. When sampling a database, it also generates a SQL rebuild script to recreate the schema and load the sampled data.
+A command line tool for creating random sub-samples of data. remnant can sample rows from CSV files or from all tables in a PostgreSQL database, outputting the results as CSV or Parquet files. When sampling a database, it also generates a SQL rebuild script to recreate the schema and load the sampled data.
 
 ## Installation
 
@@ -12,14 +12,14 @@ cargo build --release
 
 ## Usage
 
-Tranche has two subcommands: `csv` for sampling CSV files and `pg` for sampling PostgreSQL databases.
+remnant has two subcommands: `csv` for sampling CSV files and `pg` for sampling PostgreSQL databases.
 
 ### CSV Sampling
 
 Sample a percentage of rows from a CSV file:
 
 ```
-tranche csv --file <FILE> --outfile <OUTFILE> [OPTIONS]
+remnant csv --file <FILE> --outfile <OUTFILE> [OPTIONS]
 ```
 
 **Options:**
@@ -35,7 +35,7 @@ tranche csv --file <FILE> --outfile <OUTFILE> [OPTIONS]
 **Example:**
 
 ```bash
-tranche csv -f data/large_dataset.csv -o data/sample.csv -p 5 -s 42
+remnant csv -f data/large_dataset.csv -o data/sample.csv -p 5 -s 42
 ```
 
 ### PostgreSQL Database Sampling
@@ -43,7 +43,7 @@ tranche csv -f data/large_dataset.csv -o data/sample.csv -p 5 -s 42
 Sample a percentage of rows from every table in a PostgreSQL database:
 
 ```
-tranche pg --connection-string <CONNECTION_STRING> --outdir <OUTDIR> [OPTIONS]
+remnant pg --connection-string <CONNECTION_STRING> --outdir <OUTDIR> [OPTIONS]
 ```
 
 **Options:**
@@ -60,17 +60,17 @@ tranche pg --connection-string <CONNECTION_STRING> --outdir <OUTDIR> [OPTIONS]
 
 ```bash
 # Sample 10% of each table as CSV files
-tranche pg -c "host=localhost user=postgres password=secret dbname=mydb" -o ./sample_output -p 10
+remnant pg -c "host=localhost user=postgres password=secret dbname=mydb" -o ./sample_output -p 10
 
 # Sample 5% as Parquet files with a fixed seed
-tranche pg -c "postgres://postgres:secret@localhost/mydb" -o ./sample_output -p 5 -s 42 -f parquet
+remnant pg -c "postgres://postgres:secret@localhost/mydb" -o ./sample_output -p 5 -s 42 -f parquet
 ```
 
 **Output:** The output directory will contain one data file per table (e.g., `users.csv`, `orders.csv`) plus a `rebuild.sql` script.
 
 ### Rebuild Script
 
-When using the `pg` subcommand, tranche automatically generates a `rebuild.sql` file in the output directory. This script contains everything needed to recreate the sampled database:
+When using the `pg` subcommand, remnant automatically generates a `rebuild.sql` file in the output directory. This script contains everything needed to recreate the sampled database:
 
 1. `CREATE TABLE` statements with original column types, constraints, and defaults
 2. `\COPY` commands to load data from the CSV files
@@ -114,9 +114,9 @@ Integration tests require a running PostgreSQL instance. Set `TEST_DATABASE_URL`
 and enable the `integration` feature:
 
 ```bash
-export TEST_DATABASE_URL="postgres://user:pass@localhost/tranche_test"
+export TEST_DATABASE_URL="postgres://user:pass@localhost/remnant_test"
 cargo test --features integration
 ```
 
-These tests create and drop temporary tables (prefixed with `tranche_test_`)
+These tests create and drop temporary tables (prefixed with `remnant_test_`)
 automatically. Use a dedicated test database to avoid interfering with other data.
