@@ -1,64 +1,81 @@
-/// src/main.rs
-///
 use anyhow::Result;
-use clap::Parser;
-use polars::prelude::*;
-use std::fs::File;
+use clap::{Parser, Subcommand};
 use time::Instant;
+use tranche::pg::OutputFormat;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
-struct Args {
-    #[arg(short, long)]
-    file: String,
-
-    #[arg(short, long, default_value_t = 10.0)]
-    percent: f64,
-
-    #[arg(short, long, default_value_t = 10_000)]
-    max_records: i32, // Number of records for polars to scan to determine a column's type
-
-    #[arg(short, long)]
-    outfile: String,
-
-    #[arg(short, long)]
-    seed: Option<u64>,
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
 }
 
-fn main() -> Result<()> {
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Sample a percentage of rows from a CSV file
+    Csv {
+        #[arg(short, long)]
+        file: String,
+
+        #[arg(short, long, default_value_t = 10.0)]
+        percent: f64,
+
+        #[arg(short, long, default_value_t = 10_000)]
+        max_records: i32,
+
+        #[arg(short, long)]
+        outfile: String,
+
+        #[arg(short, long)]
+        seed: Option<u64>,
+    },
+    /// Sample a percentage of rows from each table in a PostgreSQL database
+    Pg {
+        #[arg(short, long)]
+        connection_string: String,
+
+        #[arg(short, long)]
+        outdir: String,
+
+        #[arg(short, long, default_value_t = 10.0)]
+        percent: f64,
+
+        #[arg(short, long)]
+        seed: Option<u64>,
+
+        #[arg(short, long, value_enum, default_value_t = OutputFormat::Csv)]
+        format: OutputFormat,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let t1 = Instant::now();
+    let cli = Cli::parse();
 
-    let args = Args::parse();
-
-    let percent = args.percent / 100.0;
-
-    let input_path = args.file;
-
-    let max_records = Some(args.max_records as usize);
-
-    // Read the CSV file into a DataFrame
-    //    let file = File::open(input_path)?;
-
-    let df = CsvReader::from_path(input_path)?
-        .infer_schema(max_records)
-        .has_header(true)
-        .finish()?;
-
-    // Sample a percentage of rows
-    let n = ((percent * df.shape().0 as f64).floor()) as usize;
-
-    let mut sampled_df = df.sample_n_literal(n, false, false, args.seed)?;
-
-    let mut outfile = File::create(&args.outfile).expect("Could not create output file...");
-
-    let _ = CsvWriter::new(&mut outfile)
-        .has_header(true)
-        .with_separator(b',')
-        .finish(&mut sampled_df);
+    match cli.command {
+        Commands::Csv {
+            file,
+            percent,
+            max_records,
+            outfile,
+            seed,
+        } => {
+            tranche::csv::run(&file, &outfile, percent, Some(max_records as usize), seed)?;
+        }
+        Commands::Pg {
+            connection_string,
+            outdir,
+            percent,
+            seed,
+            format,
+        } => {
+            tranche::pg::run(&connection_string, &outdir, percent, seed, format).await?;
+        }
+    }
 
     let t2 = Instant::now();
+    println!("Completed in: {:?}", t2 - t1);
 
-    println!("Sampling completed in: {:?}", t2 - t1);
-    println!("sample_df dimensions: {:?}", sampled_df.shape());
     Ok(())
 }
