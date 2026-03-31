@@ -1,9 +1,32 @@
+//! CSV file sampling.
+//!
+//! Reads a CSV file into a Polars DataFrame, samples a percentage of rows via
+//! [`sampling::sample_df`], and writes the result
+//! as a new CSV file.
+
 use anyhow::Result;
 use polars::prelude::*;
 use std::fs::File;
 
 use crate::sampling;
 
+/// Sample a percentage of rows from a CSV file and write the result to a new CSV.
+///
+/// Reads `file` into a Polars DataFrame, samples `percent`% of the rows
+/// (optionally with a reproducible `seed`), and writes the result to `outfile`.
+///
+/// # Arguments
+///
+/// * `file` — Path to the input CSV file.
+/// * `outfile` — Path for the output CSV file (created or overwritten).
+/// * `percent` — Percentage of rows to keep (e.g. `10.0` for 10%).
+/// * `max_records` — Maximum rows Polars examines to infer column types.
+///   This does **not** limit the number of rows read from the file.
+/// * `seed` — Optional random seed for reproducible sampling.
+///
+/// # Errors
+///
+/// Returns an error if the input file cannot be read or the CSV is malformed.
 pub fn run(
     file: &str,
     outfile: &str,

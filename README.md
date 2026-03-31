@@ -85,6 +85,58 @@ psql -d target_database -f sample_output/rebuild.sql
 
 Note: Parquet format output includes comments in place of `\COPY` commands, since PostgreSQL does not natively support Parquet import.
 
+## Library Usage
+
+remnant can also be used as a Rust library. Add it to your `Cargo.toml`:
+
+```toml
+[dependencies]
+remnant = "0.1"
+```
+
+### CSV sampling
+
+```rust
+fn main() -> anyhow::Result<()> {
+    remnant::csv::run("input.csv", "sample.csv", 10.0, Some(10_000), Some(42))?;
+    Ok(())
+}
+```
+
+### PostgreSQL sampling
+
+```rust
+use remnant::pg::OutputFormat;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    remnant::pg::run(
+        "postgres://user:pass@localhost/mydb",
+        "./output",
+        10.0,
+        Some(42),
+        OutputFormat::Csv,
+    ).await?;
+    Ok(())
+}
+```
+
+### Core sampling function
+
+If you already have a Polars DataFrame, you can sample it directly:
+
+```rust
+use polars::prelude::*;
+use remnant::sampling::sample_df;
+
+let df = DataFrame::new(vec![
+    Series::new("id", &[1, 2, 3, 4, 5]),
+]).unwrap();
+let sampled = sample_df(&df, 50.0, Some(42)).unwrap();
+```
+
+For full API documentation, run `cargo doc --open`.
+
 ## Project Structure
 
 ```

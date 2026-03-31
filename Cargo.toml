@@ -2,8 +2,12 @@
 name = "remnant"
 version = "0.1.0"
 edition = "2024"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "Create random sub-samples from CSV files or PostgreSQL databases"
+license = "MIT"
+repository = "https://github.com/ecolumix/csv-sampler"
+readme = "README.md"
+keywords = ["sampling", "csv", "postgresql", "parquet", "data"]
+categories = ["command-line-utilities", "database"]
 
 [features]
 integration = []

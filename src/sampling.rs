@@ -1,9 +1,35 @@
+//! Core sampling logic for DataFrames.
+//!
+//! This module provides [`sample_df`], which randomly samples a percentage of
+//! rows from a Polars [`DataFrame`]. Both the [`csv`](crate::csv) and
+//! [`pg`](crate::pg) modules delegate to this function for their sampling step.
+
 use anyhow::Result;
 use polars::prelude::*;
 
 /// Sample a percentage of rows from a DataFrame.
 ///
-/// `percent` is expressed as a human-readable value (e.g. 10.0 means 10%).
+/// Sampling is performed without replacement.
+///
+/// # Arguments
+///
+/// * `df` — The input DataFrame.
+/// * `percent` — Percentage of rows to retain, expressed as a human-readable
+///   value (e.g. `10.0` means 10%).
+/// * `seed` — Optional random seed for deterministic output.
+///
+/// # Examples
+///
+/// ```
+/// use polars::prelude::*;
+/// use remnant::sampling::sample_df;
+///
+/// let df = DataFrame::new(vec![
+///     Series::new("x", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+/// ]).unwrap();
+/// let sampled = sample_df(&df, 50.0, Some(42)).unwrap();
+/// assert_eq!(sampled.shape().0, 5);
+/// ```
 pub fn sample_df(df: &DataFrame, percent: f64, seed: Option<u64>) -> Result<DataFrame> {
     let frac = percent / 100.0;
     let n = ((frac * df.shape().0 as f64).floor()) as usize;
