@@ -1,3 +1,15 @@
+//! PostgreSQL database sampling and schema introspection.
+//!
+//! Connects to a PostgreSQL database, enumerates all tables in the `public`
+//! schema, and samples a configurable percentage of rows from each table
+//! concurrently. Sampled data is written as CSV or Parquet files (one per
+//! table).
+//!
+//! In addition to the data files, a `rebuild.sql` script is generated that
+//! contains `CREATE TABLE` statements, `\COPY` commands to reload the data,
+//! foreign key constraints (added after data load), and index definitions —
+//! all wrapped in a transaction.
+
 use anyhow::{Context, Result};
 use polars::prelude::*;
 use sqlx::postgres::PgPool;
@@ -6,9 +18,18 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use tokio::task::JoinSet;
 
+/// Output file format for sampled database tables.
+///
+/// Determines the file extension and serialisation format used when writing
+/// sampled data. The generated `rebuild.sql` script adjusts its load commands
+/// based on this choice.
 #[derive(Clone, Debug, clap::ValueEnum)]
 pub enum OutputFormat {
+    /// Comma-separated values — compatible with PostgreSQL `\COPY … FROM` for
+    /// rebuild.
     Csv,
+    /// Apache Parquet columnar format. The rebuild script includes a comment
+    /// noting that Parquet import requires an external tool.
     Parquet,
 }
 
@@ -176,6 +197,28 @@ async fn fetch_table_schema(pool: &PgPool, table: &str) -> Result<TableSchema> {
     })
 }
 
+/// Sample every table in a PostgreSQL database and write the results to files.
+///
+/// Connects to the database at `connection_string`, discovers all tables in the
+/// `public` schema, and samples `percent`% of each table's rows concurrently.
+/// Each table is written as a separate file (CSV or Parquet) in `outdir`.
+/// A `rebuild.sql` script is also generated that can recreate the schema and
+/// reload the sampled data.
+///
+/// # Arguments
+///
+/// * `connection_string` — PostgreSQL connection string
+///   (e.g. `"postgres://user:pass@localhost/mydb"`).
+/// * `outdir` — Directory for output files (created if it does not exist).
+/// * `percent` — Percentage of rows to sample per table (e.g. `10.0` for 10%).
+/// * `seed` — Optional seed for reproducible sampling via PostgreSQL's
+///   `setseed()`.
+/// * `format` — [`OutputFormat::Csv`] or [`OutputFormat::Parquet`].
+///
+/// # Errors
+///
+/// Returns an error if the database connection fails or the output directory
+/// cannot be created.
 pub async fn run(
     connection_string: &str,
     outdir: &str,
