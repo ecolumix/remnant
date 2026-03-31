@@ -1,9 +1,9 @@
 //! PostgreSQL database sampling and schema introspection.
 //!
-//! Connects to a PostgreSQL database, enumerates all tables in the `public`
-//! schema, and samples a configurable percentage of rows from each table
+//! Connects to a PostgreSQL database, enumerates all non-system schemas and
+//! their tables, and samples a configurable percentage of rows from each table
 //! concurrently. Sampled data is written as CSV or Parquet files (one per
-//! table).
+//! table), organised into per-schema subdirectories.
 //!
 //! In addition to the data files, a `rebuild.sql` script is generated that
 //! contains `CREATE TABLE` statements, `\COPY` commands to reload the data,
@@ -46,6 +46,7 @@ struct ColumnInfo {
 struct ForeignKey {
     constraint_name: String,
     columns: Vec<String>,
+    foreign_schema: String,
     foreign_table: String,
     foreign_columns: Vec<String>,
 }
@@ -57,6 +58,7 @@ struct IndexInfo {
 }
 
 struct TableSchema {
+    schema_name: String,
     table_name: String,
     columns: Vec<ColumnInfo>,
     primary_key_columns: Vec<String>,
@@ -64,14 +66,15 @@ struct TableSchema {
     indexes: Vec<IndexInfo>,
 }
 
-async fn fetch_columns(pool: &PgPool, table: &str) -> Result<Vec<ColumnInfo>> {
+async fn fetch_columns(pool: &PgPool, schema: &str, table: &str) -> Result<Vec<ColumnInfo>> {
     let rows = sqlx::query(
         "SELECT column_name, udt_name, character_maximum_length, \
          numeric_precision, numeric_scale, is_nullable, column_default \
          FROM information_schema.columns \
-         WHERE table_schema = 'public' AND table_name = $1 \
+         WHERE table_schema = $1 AND table_name = $2 \
          ORDER BY ordinal_position",
     )
+    .bind(schema)
     .bind(table)
     .fetch_all(pool)
     .await?;
@@ -95,18 +98,19 @@ async fn fetch_columns(pool: &PgPool, table: &str) -> Result<Vec<ColumnInfo>> {
     Ok(columns)
 }
 
-async fn fetch_primary_key(pool: &PgPool, table: &str) -> Result<Vec<String>> {
+async fn fetch_primary_key(pool: &PgPool, schema: &str, table: &str) -> Result<Vec<String>> {
     let rows = sqlx::query(
         "SELECT kcu.column_name \
          FROM information_schema.table_constraints tc \
          JOIN information_schema.key_column_usage kcu \
            ON tc.constraint_name = kcu.constraint_name \
            AND tc.table_schema = kcu.table_schema \
-         WHERE tc.table_schema = 'public' \
-           AND tc.table_name = $1 \
+         WHERE tc.table_schema = $1 \
+           AND tc.table_name = $2 \
            AND tc.constraint_type = 'PRIMARY KEY' \
          ORDER BY kcu.ordinal_position",
     )
+    .bind(schema)
     .bind(table)
     .fetch_all(pool)
     .await?;
@@ -115,9 +119,10 @@ async fn fetch_primary_key(pool: &PgPool, table: &str) -> Result<Vec<String>> {
     Ok(columns)
 }
 
-async fn fetch_foreign_keys(pool: &PgPool, table: &str) -> Result<Vec<ForeignKey>> {
+async fn fetch_foreign_keys(pool: &PgPool, schema: &str, table: &str) -> Result<Vec<ForeignKey>> {
     let rows = sqlx::query(
         "SELECT tc.constraint_name, kcu.column_name, \
+                ccu.table_schema AS foreign_table_schema, \
                 ccu.table_name AS foreign_table_name, \
                 ccu.column_name AS foreign_column_name \
          FROM information_schema.table_constraints tc \
@@ -126,11 +131,12 @@ async fn fetch_foreign_keys(pool: &PgPool, table: &str) -> Result<Vec<ForeignKey
            AND tc.table_schema = kcu.table_schema \
          JOIN information_schema.constraint_column_usage ccu \
            ON tc.constraint_name = ccu.constraint_name \
-         WHERE tc.table_schema = 'public' \
-           AND tc.table_name = $1 \
+         WHERE tc.table_schema = $1 \
+           AND tc.table_name = $2 \
            AND tc.constraint_type = 'FOREIGN KEY' \
          ORDER BY tc.constraint_name, kcu.ordinal_position",
     )
+    .bind(schema)
     .bind(table)
     .fetch_all(pool)
     .await?;
@@ -139,6 +145,7 @@ async fn fetch_foreign_keys(pool: &PgPool, table: &str) -> Result<Vec<ForeignKey
     for row in &rows {
         let constraint_name: String = row.get("constraint_name");
         let column_name: String = row.get("column_name");
+        let foreign_schema: String = row.get("foreign_table_schema");
         let foreign_table: String = row.get("foreign_table_name");
         let foreign_column: String = row.get("foreign_column_name");
 
@@ -147,6 +154,7 @@ async fn fetch_foreign_keys(pool: &PgPool, table: &str) -> Result<Vec<ForeignKey
             .or_insert_with(|| ForeignKey {
                 constraint_name,
                 columns: Vec::new(),
+                foreign_schema,
                 foreign_table,
                 foreign_columns: Vec::new(),
             });
@@ -157,16 +165,17 @@ async fn fetch_foreign_keys(pool: &PgPool, table: &str) -> Result<Vec<ForeignKey
     Ok(fk_map.into_values().collect())
 }
 
-async fn fetch_indexes(pool: &PgPool, table: &str) -> Result<Vec<IndexInfo>> {
+async fn fetch_indexes(pool: &PgPool, schema: &str, table: &str) -> Result<Vec<IndexInfo>> {
     let rows = sqlx::query(
         "SELECT indexname, indexdef \
          FROM pg_indexes \
-         WHERE schemaname = 'public' AND tablename = $1 \
+         WHERE schemaname = $1 AND tablename = $2 \
            AND indexname NOT IN ( \
              SELECT constraint_name FROM information_schema.table_constraints \
-             WHERE table_schema = 'public' AND constraint_type = 'PRIMARY KEY' \
+             WHERE table_schema = $1 AND constraint_type = 'PRIMARY KEY' \
            )",
     )
+    .bind(schema)
     .bind(table)
     .fetch_all(pool)
     .await?;
@@ -182,13 +191,14 @@ async fn fetch_indexes(pool: &PgPool, table: &str) -> Result<Vec<IndexInfo>> {
     Ok(indexes)
 }
 
-async fn fetch_table_schema(pool: &PgPool, table: &str) -> Result<TableSchema> {
-    let columns = fetch_columns(pool, table).await?;
-    let primary_key_columns = fetch_primary_key(pool, table).await?;
-    let foreign_keys = fetch_foreign_keys(pool, table).await?;
-    let indexes = fetch_indexes(pool, table).await?;
+async fn fetch_table_schema(pool: &PgPool, schema: &str, table: &str) -> Result<TableSchema> {
+    let columns = fetch_columns(pool, schema, table).await?;
+    let primary_key_columns = fetch_primary_key(pool, schema, table).await?;
+    let foreign_keys = fetch_foreign_keys(pool, schema, table).await?;
+    let indexes = fetch_indexes(pool, schema, table).await?;
 
     Ok(TableSchema {
+        schema_name: schema.to_string(),
         table_name: table.to_string(),
         columns,
         primary_key_columns,
@@ -199,11 +209,11 @@ async fn fetch_table_schema(pool: &PgPool, table: &str) -> Result<TableSchema> {
 
 /// Sample every table in a PostgreSQL database and write the results to files.
 ///
-/// Connects to the database at `connection_string`, discovers all tables in the
-/// `public` schema, and samples `percent`% of each table's rows concurrently.
-/// Each table is written as a separate file (CSV or Parquet) in `outdir`.
-/// A `rebuild.sql` script is also generated that can recreate the schema and
-/// reload the sampled data.
+/// Connects to the database at `connection_string`, discovers all non-system
+/// schemas and their tables, and samples `percent`% of each table's rows
+/// concurrently. Each table is written as a separate file (CSV or Parquet) in
+/// a per-schema subdirectory under `outdir`. A `rebuild.sql` script is also
+/// generated that can recreate the schemas and reload the sampled data.
 ///
 /// # Arguments
 ///
@@ -214,6 +224,8 @@ async fn fetch_table_schema(pool: &PgPool, table: &str) -> Result<TableSchema> {
 /// * `seed` — Optional seed for reproducible sampling via PostgreSQL's
 ///   `setseed()`.
 /// * `format` — [`OutputFormat::Csv`] or [`OutputFormat::Parquet`].
+/// * `schema_filter` — Optional list of schema names to include. When `None`,
+///   all non-system schemas are sampled.
 ///
 /// # Errors
 ///
@@ -225,6 +237,7 @@ pub async fn run(
     percent: f64,
     seed: Option<u64>,
     format: OutputFormat,
+    schema_filter: Option<Vec<String>>,
 ) -> Result<()> {
     let pool = PgPool::connect(connection_string)
         .await
@@ -232,33 +245,53 @@ pub async fn run(
 
     fs::create_dir_all(outdir).context("Failed to create output directory")?;
 
-    let tables = enumerate_tables(&pool).await?;
+    let db_schemas = enumerate_schemas(&pool, schema_filter.as_deref()).await?;
 
-    if tables.is_empty() {
-        println!("No tables found in public schema.");
+    if db_schemas.is_empty() {
+        println!("No schemas found.");
         return Ok(());
     }
 
-    println!("Found {} table(s) in public schema.", tables.len());
+    let mut all_tables: Vec<(String, String)> = Vec::new();
+    for schema in &db_schemas {
+        let tables = enumerate_tables(&pool, schema).await?;
+        for table in tables {
+            all_tables.push((schema.clone(), table));
+        }
+    }
+
+    if all_tables.is_empty() {
+        println!("No tables found in schemas: {:?}", db_schemas);
+        return Ok(());
+    }
+
+    println!(
+        "Found {} table(s) across {} schema(s).",
+        all_tables.len(),
+        db_schemas.len()
+    );
 
     let mut set = JoinSet::new();
 
-    for table in tables {
+    for (schema, table) in all_tables {
         let pool = pool.clone();
         let outdir = outdir.to_string();
         let format = format.clone();
 
         set.spawn(async move {
-            match process_table(&pool, &table, &outdir, percent, seed, &format).await {
-                Ok(()) => match fetch_table_schema(&pool, &table).await {
-                    Ok(schema) => Some(schema),
+            match process_table(&pool, &schema, &table, &outdir, percent, seed, &format).await {
+                Ok(()) => match fetch_table_schema(&pool, &schema, &table).await {
+                    Ok(ts) => Some(ts),
                     Err(e) => {
-                        eprintln!("Warning: could not fetch schema for '{}': {}", table, e);
+                        eprintln!(
+                            "Warning: could not fetch schema for '{}'.'{}':{}",
+                            schema, table, e
+                        );
                         None
                     }
                 },
                 Err(e) => {
-                    eprintln!("Warning: skipping table '{}': {}", table, e);
+                    eprintln!("Warning: skipping table '{}'.'{}':{}", schema, table, e);
                     None
                 }
             }
@@ -272,7 +305,7 @@ pub async fn run(
         }
     }
 
-    schemas.sort_by(|a, b| a.table_name.cmp(&b.table_name));
+    schemas.sort_by(|a, b| (&a.schema_name, &a.table_name).cmp(&(&b.schema_name, &b.table_name)));
 
     if !schemas.is_empty() {
         let sql = generate_rebuild_sql(&schemas, &format);
@@ -284,18 +317,46 @@ pub async fn run(
     Ok(())
 }
 
-async fn count_rows(pool: &PgPool, table: &str) -> Result<i64> {
-    let query = format!("SELECT COUNT(*) FROM \"{}\"", table);
+async fn count_rows(pool: &PgPool, schema: &str, table: &str) -> Result<i64> {
+    let query = format!("SELECT COUNT(*) FROM \"{}\".\"{}\"", schema, table);
     let row: (i64,) = sqlx::query_as(&query).fetch_one(pool).await?;
     Ok(row.0)
 }
 
-async fn enumerate_tables(pool: &PgPool) -> Result<Vec<String>> {
+async fn enumerate_schemas(pool: &PgPool, filter: Option<&[String]>) -> Result<Vec<String>> {
+    let schemas = if let Some(names) = filter {
+        sqlx::query(
+            "SELECT schema_name FROM information_schema.schemata \
+             WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
+               AND schema_name NOT LIKE 'pg_temp_%' \
+               AND schema_name = ANY($1::text[]) \
+             ORDER BY schema_name",
+        )
+        .bind(names)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT schema_name FROM information_schema.schemata \
+             WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
+               AND schema_name NOT LIKE 'pg_temp_%' \
+             ORDER BY schema_name",
+        )
+        .fetch_all(pool)
+        .await?
+    };
+
+    let names: Vec<String> = schemas.iter().map(|r| r.get(0)).collect();
+    Ok(names)
+}
+
+async fn enumerate_tables(pool: &PgPool, schema: &str) -> Result<Vec<String>> {
     let rows = sqlx::query(
         "SELECT table_name FROM information_schema.tables \
-         WHERE table_schema = 'public' AND table_type = 'BASE TABLE' \
+         WHERE table_schema = $1 AND table_type = 'BASE TABLE' \
          ORDER BY table_name",
     )
+    .bind(schema)
     .fetch_all(pool)
     .await?;
 
@@ -313,21 +374,22 @@ fn map_seed_to_pg(s: u64) -> f64 {
 
 async fn process_table(
     pool: &PgPool,
+    schema: &str,
     table: &str,
     outdir: &str,
     percent: f64,
     seed: Option<u64>,
     format: &OutputFormat,
 ) -> Result<()> {
-    println!("Processing table '{}'...", table);
+    println!("Processing table '{}'.'{}'...", schema, table);
 
-    let total_rows = count_rows(pool, table).await?;
+    let total_rows = count_rows(pool, schema, table).await?;
     let n = calculate_sample_count(percent, total_rows);
 
     let mut df = if n == 0 || total_rows == 0 {
-        read_table_to_df(pool, table, None, None).await?
+        read_table_to_df(pool, schema, table, None, None).await?
     } else {
-        read_table_to_df(pool, table, Some(n), seed).await?
+        read_table_to_df(pool, schema, table, Some(n), seed).await?
     };
     let sampled_rows = df.shape().0;
 
@@ -335,7 +397,9 @@ async fn process_table(
         OutputFormat::Csv => "csv",
         OutputFormat::Parquet => "parquet",
     };
-    let outpath = format!("{}/{}.{}", outdir, table, ext);
+    let schema_dir = format!("{}/{}", outdir, schema);
+    fs::create_dir_all(&schema_dir).context("Failed to create schema output directory")?;
+    let outpath = format!("{}/{}.{}", schema_dir, table, ext);
 
     write_output(&mut df, &outpath, format)?;
 
@@ -349,10 +413,12 @@ async fn process_table(
 
 async fn read_table_to_df(
     pool: &PgPool,
+    schema: &str,
     table: &str,
     limit: Option<i64>,
     seed: Option<u64>,
 ) -> Result<DataFrame> {
+    let qualified = format!("\"{}\".\"{}\"", schema, table);
     let rows = if let Some(n) = limit {
         // Acquire a dedicated connection so setseed() and the query share the same session
         let mut conn = pool.acquire().await?;
@@ -362,15 +428,15 @@ async fn read_table_to_df(
                 .execute(&mut *conn)
                 .await?;
         }
-        let query = format!("SELECT * FROM \"{}\" ORDER BY RANDOM() LIMIT {}", table, n);
+        let query = format!("SELECT * FROM {} ORDER BY RANDOM() LIMIT {}", qualified, n);
         sqlx::query(&query).fetch_all(&mut *conn).await?
     } else {
-        let query = format!("SELECT * FROM \"{}\"", table);
+        let query = format!("SELECT * FROM {}", qualified);
         sqlx::query(&query).fetch_all(pool).await?
     };
 
     if rows.is_empty() {
-        let describe_query = format!("SELECT * FROM \"{}\"", table);
+        let describe_query = format!("SELECT * FROM {}", qualified);
         let describe = pool.describe(describe_query.as_str()).await?;
         let columns: Vec<Series> = describe
             .columns()
@@ -473,7 +539,10 @@ fn udt_to_sql_type(col: &ColumnInfo) -> String {
 }
 
 fn generate_create_table(schema: &TableSchema) -> String {
-    let mut sql = format!("CREATE TABLE \"{}\" (\n", schema.table_name);
+    let mut sql = format!(
+        "CREATE TABLE \"{}\".\"{}\" (\n",
+        schema.schema_name, schema.table_name
+    );
 
     let mut col_defs: Vec<String> = Vec::new();
     for col in &schema.columns {
@@ -519,10 +588,12 @@ fn generate_foreign_keys(schema: &TableSchema) -> String {
             .collect();
 
         sql.push_str(&format!(
-            "ALTER TABLE \"{}\" ADD CONSTRAINT \"{}\" FOREIGN KEY ({}) REFERENCES \"{}\" ({});\n",
+            "ALTER TABLE \"{}\".\"{}\" ADD CONSTRAINT \"{}\" FOREIGN KEY ({}) REFERENCES \"{}\".\"{}\" ({});\n",
+            schema.schema_name,
             schema.table_name,
             fk.constraint_name,
             local_cols.join(", "),
+            fk.foreign_schema,
             fk.foreign_table,
             foreign_cols.join(", "),
         ));
@@ -530,19 +601,19 @@ fn generate_foreign_keys(schema: &TableSchema) -> String {
     sql
 }
 
-fn generate_copy_command(table: &str, format: &OutputFormat) -> String {
+fn generate_copy_command(schema: &TableSchema, format: &OutputFormat) -> String {
     match format {
         OutputFormat::Csv => {
             format!(
-                "\\COPY \"{}\" FROM '{}.csv' WITH (FORMAT csv, HEADER true);\n",
-                table, table
+                "\\COPY \"{}\".\"{}\" FROM '{}/{}.csv' WITH (FORMAT csv, HEADER true);\n",
+                schema.schema_name, schema.table_name, schema.schema_name, schema.table_name
             )
         }
         OutputFormat::Parquet => {
             format!(
                 "-- Parquet loading requires an external tool (e.g., pgloader, or convert to CSV first)\n\
-                 -- Data file: {}.parquet\n",
-                table
+                 -- Data file: {}/{}.parquet\n",
+                schema.schema_name, schema.table_name
             )
         }
     }
@@ -555,6 +626,14 @@ fn generate_rebuild_sql(schemas: &[TableSchema], format: &OutputFormat) -> Strin
     sql.push_str("-- Rebuild script for sampled database\n\n");
     sql.push_str("BEGIN;\n\n");
 
+    // 0. CREATE SCHEMA statements
+    let schema_names: std::collections::BTreeSet<&str> =
+        schemas.iter().map(|s| s.schema_name.as_str()).collect();
+    for name in &schema_names {
+        sql.push_str(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\";\n", name));
+    }
+    sql.push('\n');
+
     // 1. CREATE TABLE statements
     for schema in schemas {
         sql.push_str(&generate_create_table(schema));
@@ -563,7 +642,7 @@ fn generate_rebuild_sql(schemas: &[TableSchema], format: &OutputFormat) -> Strin
 
     // 2. COPY commands (after all tables exist)
     for schema in schemas {
-        sql.push_str(&generate_copy_command(&schema.table_name, format));
+        sql.push_str(&generate_copy_command(schema, format));
     }
     sql.push('\n');
 
@@ -865,6 +944,7 @@ mod tests {
     #[test]
     fn test_generate_create_table() {
         let schema = TableSchema {
+            schema_name: "public".to_string(),
             table_name: "users".to_string(),
             columns: vec![
                 col(
@@ -886,7 +966,7 @@ mod tests {
         };
 
         let sql = generate_create_table(&schema);
-        assert!(sql.contains("CREATE TABLE \"users\""));
+        assert!(sql.contains("CREATE TABLE \"public\".\"users\""));
         assert!(sql.contains("\"id\" SERIAL NOT NULL"));
         assert!(sql.contains("\"name\" VARCHAR(100) NOT NULL"));
         assert!(sql.contains("\"email\" TEXT"));
@@ -899,12 +979,14 @@ mod tests {
     #[test]
     fn test_generate_foreign_keys() {
         let schema = TableSchema {
+            schema_name: "public".to_string(),
             table_name: "orders".to_string(),
             columns: vec![],
             primary_key_columns: vec![],
             foreign_keys: vec![ForeignKey {
                 constraint_name: "orders_customer_id_fkey".to_string(),
                 columns: vec!["customer_id".to_string()],
+                foreign_schema: "public".to_string(),
                 foreign_table: "customers".to_string(),
                 foreign_columns: vec!["id".to_string()],
             }],
@@ -912,30 +994,47 @@ mod tests {
         };
 
         let sql = generate_foreign_keys(&schema);
-        assert!(sql.contains("ALTER TABLE \"orders\""));
+        assert!(sql.contains("ALTER TABLE \"public\".\"orders\""));
         assert!(sql.contains("ADD CONSTRAINT \"orders_customer_id_fkey\""));
         assert!(sql.contains("FOREIGN KEY (\"customer_id\")"));
-        assert!(sql.contains("REFERENCES \"customers\" (\"id\")"));
+        assert!(sql.contains("REFERENCES \"public\".\"customers\" (\"id\")"));
     }
 
     #[test]
     fn test_generate_copy_command_csv() {
-        let sql = generate_copy_command("users", &OutputFormat::Csv);
-        assert!(sql.contains("\\COPY \"users\" FROM 'users.csv'"));
+        let schema = TableSchema {
+            schema_name: "public".to_string(),
+            table_name: "users".to_string(),
+            columns: vec![],
+            primary_key_columns: vec![],
+            foreign_keys: vec![],
+            indexes: vec![],
+        };
+        let sql = generate_copy_command(&schema, &OutputFormat::Csv);
+        assert!(sql.contains("\\COPY \"public\".\"users\" FROM 'public/users.csv'"));
         assert!(sql.contains("FORMAT csv, HEADER true"));
     }
 
     #[test]
     fn test_generate_copy_command_parquet() {
-        let sql = generate_copy_command("users", &OutputFormat::Parquet);
+        let schema = TableSchema {
+            schema_name: "public".to_string(),
+            table_name: "users".to_string(),
+            columns: vec![],
+            primary_key_columns: vec![],
+            foreign_keys: vec![],
+            indexes: vec![],
+        };
+        let sql = generate_copy_command(&schema, &OutputFormat::Parquet);
         assert!(sql.contains("Parquet loading requires"));
-        assert!(sql.contains("users.parquet"));
+        assert!(sql.contains("public/users.parquet"));
     }
 
     #[test]
     fn test_generate_rebuild_sql_ordering() {
         let schemas = vec![
             TableSchema {
+                schema_name: "public".to_string(),
                 table_name: "customers".to_string(),
                 columns: vec![
                     col("id", "int4", false, None, None, None, None),
@@ -946,6 +1045,7 @@ mod tests {
                 indexes: vec![],
             },
             TableSchema {
+                schema_name: "public".to_string(),
                 table_name: "orders".to_string(),
                 columns: vec![
                     col("id", "int4", false, None, None, None, None),
@@ -955,6 +1055,7 @@ mod tests {
                 foreign_keys: vec![ForeignKey {
                     constraint_name: "orders_customer_id_fkey".to_string(),
                     columns: vec!["customer_id".to_string()],
+                    foreign_schema: "public".to_string(),
                     foreign_table: "customers".to_string(),
                     foreign_columns: vec!["id".to_string()],
                 }],
@@ -967,12 +1068,17 @@ mod tests {
 
         let sql = generate_rebuild_sql(&schemas, &OutputFormat::Csv);
 
-        // Verify ordering: CREATE TABLE before COPY before FK before INDEX
+        // Verify CREATE SCHEMA comes first
+        let schema_pos = sql.find("CREATE SCHEMA IF NOT EXISTS").unwrap();
         let create_pos = sql.find("CREATE TABLE").unwrap();
         let copy_pos = sql.find("\\COPY").unwrap();
         let fk_pos = sql.find("ALTER TABLE").unwrap();
         let idx_pos = sql.find("CREATE INDEX").unwrap();
 
+        assert!(
+            schema_pos < create_pos,
+            "CREATE SCHEMA should come before CREATE TABLE"
+        );
         assert!(
             create_pos < copy_pos,
             "CREATE TABLE should come before COPY"
@@ -984,6 +1090,7 @@ mod tests {
         assert!(sql.starts_with("-- Generated by remnant"));
         assert!(sql.contains("BEGIN;"));
         assert!(sql.contains("COMMIT;"));
+        assert!(sql.contains("CREATE SCHEMA IF NOT EXISTS \"public\""));
     }
 
     // -- Seed conversion tests --
@@ -1193,7 +1300,7 @@ mod integration_tests {
     async fn test_count_rows() {
         let pool = PgPool::connect(&database_url()).await.unwrap();
         let table = setup_test_table(&pool, "count", 100).await;
-        let count = count_rows(&pool, &table).await.unwrap();
+        let count = count_rows(&pool, "public", &table).await.unwrap();
         assert_eq!(count, 100);
         teardown_test_table(&pool, &table).await;
     }
@@ -1202,7 +1309,7 @@ mod integration_tests {
     async fn test_enumerate_tables() {
         let pool = PgPool::connect(&database_url()).await.unwrap();
         let table = setup_test_table(&pool, "enumerate", 1).await;
-        let tables = enumerate_tables(&pool).await.unwrap();
+        let tables = enumerate_tables(&pool, "public").await.unwrap();
         assert!(
             tables.contains(&table),
             "expected {} in {:?}",
@@ -1216,7 +1323,9 @@ mod integration_tests {
     async fn test_read_table_full() {
         let pool = PgPool::connect(&database_url()).await.unwrap();
         let table = setup_test_table(&pool, "read_full", 50).await;
-        let df = read_table_to_df(&pool, &table, None, None).await.unwrap();
+        let df = read_table_to_df(&pool, "public", &table, None, None)
+            .await
+            .unwrap();
         assert_eq!(df.shape().0, 50);
         teardown_test_table(&pool, &table).await;
     }
@@ -1225,7 +1334,7 @@ mod integration_tests {
     async fn test_read_table_with_limit() {
         let pool = PgPool::connect(&database_url()).await.unwrap();
         let table = setup_test_table(&pool, "read_limit", 100).await;
-        let df = read_table_to_df(&pool, &table, Some(20), None)
+        let df = read_table_to_df(&pool, "public", &table, Some(20), None)
             .await
             .unwrap();
         assert_eq!(df.shape().0, 20);
@@ -1236,10 +1345,10 @@ mod integration_tests {
     async fn test_read_table_with_seed_determinism() {
         let pool = PgPool::connect(&database_url()).await.unwrap();
         let table = setup_test_table(&pool, "read_seed", 100).await;
-        let df1 = read_table_to_df(&pool, &table, Some(30), Some(42))
+        let df1 = read_table_to_df(&pool, "public", &table, Some(30), Some(42))
             .await
             .unwrap();
-        let df2 = read_table_to_df(&pool, &table, Some(30), Some(42))
+        let df2 = read_table_to_df(&pool, "public", &table, Some(30), Some(42))
             .await
             .unwrap();
         assert!(
@@ -1253,7 +1362,9 @@ mod integration_tests {
     async fn test_read_table_empty() {
         let pool = PgPool::connect(&database_url()).await.unwrap();
         let table = setup_test_table(&pool, "read_empty", 0).await;
-        let df = read_table_to_df(&pool, &table, None, None).await.unwrap();
+        let df = read_table_to_df(&pool, "public", &table, None, None)
+            .await
+            .unwrap();
         assert_eq!(df.shape().0, 0);
         assert!(df.width() > 0, "empty table should still have columns");
         teardown_test_table(&pool, &table).await;
@@ -1266,11 +1377,19 @@ mod integration_tests {
         let dir = tempfile::tempdir().unwrap();
         let outdir = dir.path().to_str().unwrap();
 
-        process_table(&pool, &table, outdir, 25.0, Some(42), &OutputFormat::Csv)
-            .await
-            .unwrap();
+        process_table(
+            &pool,
+            "public",
+            &table,
+            outdir,
+            25.0,
+            Some(42),
+            &OutputFormat::Csv,
+        )
+        .await
+        .unwrap();
 
-        let outpath = format!("{}/{}.csv", outdir, table);
+        let outpath = format!("{}/public/{}.csv", outdir, table);
         let content = std::fs::read_to_string(&outpath).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 51, "header + 50 rows (25% of 200)");
@@ -1286,22 +1405,30 @@ mod integration_tests {
         let dir = tempfile::tempdir().unwrap();
         let outdir = dir.path().to_str().unwrap();
 
-        run(&database_url(), outdir, 10.0, Some(42), OutputFormat::Csv)
-            .await
-            .unwrap();
+        run(
+            &database_url(),
+            outdir,
+            10.0,
+            Some(42),
+            OutputFormat::Csv,
+            Some(vec!["public".to_string()]),
+        )
+        .await
+        .unwrap();
 
-        // Verify output files exist
-        let path1 = dir.path().join(format!("{}.csv", table1));
-        let path2 = dir.path().join(format!("{}.csv", table2));
+        // Verify output files exist in schema subdirectory
+        let path1 = dir.path().join("public").join(format!("{}.csv", table1));
+        let path2 = dir.path().join("public").join(format!("{}.csv", table2));
         assert!(path1.exists(), "output file for {} should exist", table1);
         assert!(path2.exists(), "output file for {} should exist", table2);
 
-        // Verify rebuild.sql exists and references our tables
+        // Verify rebuild.sql exists and references our tables with schema qualification
         let rebuild_path = dir.path().join("rebuild.sql");
         assert!(rebuild_path.exists(), "rebuild.sql should exist");
         let sql = std::fs::read_to_string(&rebuild_path).unwrap();
-        assert!(sql.contains(&format!("CREATE TABLE \"{}\"", table1)));
-        assert!(sql.contains(&format!("CREATE TABLE \"{}\"", table2)));
+        assert!(sql.contains(&format!("CREATE TABLE \"public\".\"{}\"", table1)));
+        assert!(sql.contains(&format!("CREATE TABLE \"public\".\"{}\"", table2)));
+        assert!(sql.contains("CREATE SCHEMA IF NOT EXISTS \"public\""));
 
         teardown_test_table(&pool, &table1).await;
         teardown_test_table(&pool, &table2).await;

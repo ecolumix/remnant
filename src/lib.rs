@@ -24,6 +24,7 @@
 //!     10.0,
 //!     Some(42),
 //!     OutputFormat::Csv,
+//!     None, // sample all non-system schemas
 //! ).await.unwrap();
 //! # });
 //! ```
