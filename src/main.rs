@@ -40,11 +40,15 @@ enum Commands {
         #[arg(short, long, default_value_t = 10.0)]
         percent: f64,
 
-        #[arg(short, long)]
+        #[arg(short = 'S', long)]
         seed: Option<u64>,
 
         #[arg(short, long, value_enum, default_value_t = OutputFormat::Csv)]
         format: OutputFormat,
+
+        /// Comma-separated list of schemas to include (default: all non-system schemas)
+        #[arg(long, value_delimiter = ',')]
+        schemas: Option<Vec<String>>,
     },
 }
 
@@ -69,8 +73,9 @@ async fn main() -> Result<()> {
             percent,
             seed,
             format,
+            schemas,
         } => {
-            remnant::pg::run(&connection_string, &outdir, percent, seed, format).await?;
+            remnant::pg::run(&connection_string, &outdir, percent, seed, format, schemas).await?;
         }
     }
 
