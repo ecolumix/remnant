@@ -245,8 +245,7 @@ pub async fn run(
 
     fs::create_dir_all(outdir).context("Failed to create output directory")?;
 
-    let db_schemas =
-        enumerate_schemas(&pool, schema_filter.as_deref()).await?;
+    let db_schemas = enumerate_schemas(&pool, schema_filter.as_deref()).await?;
 
     if db_schemas.is_empty() {
         println!("No schemas found.");
@@ -285,7 +284,8 @@ pub async fn run(
                     Ok(ts) => Some(ts),
                     Err(e) => {
                         eprintln!(
-                            "Warning: could not fetch schema for '{}'.'{}':{}", schema, table, e
+                            "Warning: could not fetch schema for '{}'.'{}':{}",
+                            schema, table, e
                         );
                         None
                     }
@@ -305,9 +305,7 @@ pub async fn run(
         }
     }
 
-    schemas.sort_by(|a, b| {
-        (&a.schema_name, &a.table_name).cmp(&(&b.schema_name, &b.table_name))
-    });
+    schemas.sort_by(|a, b| (&a.schema_name, &a.table_name).cmp(&(&b.schema_name, &b.table_name)));
 
     if !schemas.is_empty() {
         let sql = generate_rebuild_sql(&schemas, &format);
@@ -1325,7 +1323,9 @@ mod integration_tests {
     async fn test_read_table_full() {
         let pool = PgPool::connect(&database_url()).await.unwrap();
         let table = setup_test_table(&pool, "read_full", 50).await;
-        let df = read_table_to_df(&pool, "public", &table, None, None).await.unwrap();
+        let df = read_table_to_df(&pool, "public", &table, None, None)
+            .await
+            .unwrap();
         assert_eq!(df.shape().0, 50);
         teardown_test_table(&pool, &table).await;
     }
@@ -1362,7 +1362,9 @@ mod integration_tests {
     async fn test_read_table_empty() {
         let pool = PgPool::connect(&database_url()).await.unwrap();
         let table = setup_test_table(&pool, "read_empty", 0).await;
-        let df = read_table_to_df(&pool, "public", &table, None, None).await.unwrap();
+        let df = read_table_to_df(&pool, "public", &table, None, None)
+            .await
+            .unwrap();
         assert_eq!(df.shape().0, 0);
         assert!(df.width() > 0, "empty table should still have columns");
         teardown_test_table(&pool, &table).await;
@@ -1375,9 +1377,17 @@ mod integration_tests {
         let dir = tempfile::tempdir().unwrap();
         let outdir = dir.path().to_str().unwrap();
 
-        process_table(&pool, "public", &table, outdir, 25.0, Some(42), &OutputFormat::Csv)
-            .await
-            .unwrap();
+        process_table(
+            &pool,
+            "public",
+            &table,
+            outdir,
+            25.0,
+            Some(42),
+            &OutputFormat::Csv,
+        )
+        .await
+        .unwrap();
 
         let outpath = format!("{}/public/{}.csv", outdir, table);
         let content = std::fs::read_to_string(&outpath).unwrap();
