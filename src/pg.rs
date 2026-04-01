@@ -540,7 +540,7 @@ fn udt_to_sql_type(col: &ColumnInfo) -> String {
 
 fn generate_create_table(schema: &TableSchema) -> String {
     let mut sql = format!(
-        "CREATE TABLE \"{}\".\"{}\" (\n",
+        "CREATE TABLE IF NOT EXISTS \"{}\".\"{}\" (\n",
         schema.schema_name, schema.table_name
     );
 
